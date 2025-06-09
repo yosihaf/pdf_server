@@ -1,75 +1,18 @@
-# ===== app/database/connection.py =====
-from sqlalchemy import create_engine
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-import os
+# app/routers/auth.py - עם ניהול זמני תוקף מתקדם
 
-# הגדרת מסד נתונים (SQLite לפיתוח)
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./app.db")
-
-engine = create_engine(
-    DATABASE_URL, 
-    connect_args={"check_same_thread": False} if "sqlite" in DATABASE_URL else {}
-)
-
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-def get_db():
-    """Dependency לקבלת session של מסד נתונים"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-def init_db():
-    """יצירת הטבלאות"""
-    from .models import User  # import כאן כדי למנוע circular import
-    Base.metadata.create_all(bind=engine)
-
-# ===== app/database/schemas.py =====
-from pydantic import BaseModel, EmailStr
-from datetime import datetime
-from typing import Optional
-
-class UserBase(BaseModel):
-    username: str
-    email: EmailStr
-
-class UserCreate(UserBase):
-    password: str
-
-class UserResponse(UserBase):
-    id: int
-    is_active: bool
-    created_at: datetime
-    
-    class Config:
-        from_attributes = True
-
-class UserInDB(UserBase):
-    id: int
-    hashed_password: str
-    is_active: bool
-    created_at: datetime
-
-class Token(BaseModel):
-    access_token: str
-    token_type: str
-
-class TokenData(BaseModel):
-    username: Optional[str] = None
-
-# ===== app/routers/auth.py - מלא =====
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
-from ..database.connection import get_db, init_db
-from ..database.models import User
-from ..auth.jwt_handler import create_access_token, verify_password, hash_password
-from ..auth.dependencies import get_current_user
+from datetime import timedelta
 import logging
+
+from ..database.connection import get_db
+from ..database.models import User
+from ..auth.jwt_handler import (
+    create_access_token, create_refresh_token, verify_password, 
+    hash_password, get_token_expiry_info, TOKEN_EXPIRY_SETTINGS
+)
+from ..auth.dependencies import get_current_user
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +29,7 @@ router = APIRouter(
 class LoginRequest(BaseModel):
     username: str
     password: str
+    remember_me: bool = False  # האם לזכור אותי (טוקן ארוך יותר)
 
 class RegisterRequest(BaseModel):
     username: str
@@ -94,22 +38,28 @@ class RegisterRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
+    refresh_token: str = None
     token_type: str
-    expires_in: int
+    expires_in: int  # בדקות
+    expires_at: str  # זמן מדויק
+
+class RefreshTokenRequest(BaseModel):
+    refresh_token: str
+
+class TokenInfo(BaseModel):
+    expires_at: str
+    time_left_minutes: int
+    is_expired: bool
 
 class UserInfo(BaseModel):
     username: str
     user_id: str
     email: str
-
-class AuthResponse(BaseModel):
-    status: str
-    message: str
-    data: dict = None
+    is_admin: bool = False
 
 @router.post("/login", response_model=TokenResponse)
 async def login(request: LoginRequest, db: Session = Depends(get_db)):
-    """התחברות משתמש"""
+    """התחברות עם אפשרות לבחור זמן תוקף"""
     try:
         # חיפוש המשתמש במסד הנתונים
         user = db.query(User).filter(User.username == request.username).first()
@@ -128,21 +78,45 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
                 detail="החשבון אינו פעיל"
             )
         
+        # קבע זמן תוקף לפי סוג המשתמש והעדפות
+        if request.remember_me:
+            expire_minutes = TOKEN_EXPIRY_SETTINGS.get("premium", 480)  # 8 שעות
+        else:
+            # בדוק אם המשתמש הוא מנהל
+            is_admin = user.username in ["admin", "manager", "root"]
+            expire_minutes = TOKEN_EXPIRY_SETTINGS.get(
+                "admin" if is_admin else "regular_user", 30
+            )
+        
         # יצירת טוקן
         token_data = {
             "sub": user.username,
             "user_id": str(user.id),
-            "email": user.email
+            "email": user.email,
+            "is_admin": is_admin
         }
         
-        access_token = create_access_token(token_data)
+        access_token = create_access_token(
+            token_data, 
+            expires_delta=timedelta(minutes=expire_minutes)
+        )
         
-        logger.info(f"Successful login for user: {user.username}")
+        # יצירת refresh token אם נבקש
+        refresh_token = None
+        if request.remember_me:
+            refresh_token = create_refresh_token(token_data)
+        
+        from datetime import datetime
+        expires_at = (datetime.utcnow() + timedelta(minutes=expire_minutes)).isoformat()
+        
+        logger.info(f"Successful login for user: {user.username} (expires in {expire_minutes} minutes)")
         
         return TokenResponse(
             access_token=access_token,
+            refresh_token=refresh_token,
             token_type="bearer",
-            expires_in=30 * 60  # 30 דקות
+            expires_in=expire_minutes,
+            expires_at=expires_at
         )
         
     except HTTPException:
@@ -154,7 +128,66 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
             detail="שגיאה בהתחברות"
         )
 
-@router.post("/register", response_model=AuthResponse)
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh_token(request: RefreshTokenRequest):
+    """חידוש טוקן באמצעות refresh token"""
+    try:
+        from ..auth.jwt_handler import verify_token
+        
+        # אמת את ה-refresh token
+        payload = verify_token(request.refresh_token)
+        if not payload or payload.get("type") != "refresh":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Refresh token לא תקף"
+            )
+        
+        # יצור טוקן חדש
+        token_data = {
+            "sub": payload.get("sub"),
+            "user_id": payload.get("user_id"),
+            "email": payload.get("email"),
+            "is_admin": payload.get("is_admin", False)
+        }
+        
+        expire_minutes = TOKEN_EXPIRY_SETTINGS.get("regular_user", 30)
+        access_token = create_access_token(
+            token_data,
+            expires_delta=timedelta(minutes=expire_minutes)
+        )
+        
+        from datetime import datetime
+        expires_at = (datetime.utcnow() + timedelta(minutes=expire_minutes)).isoformat()
+        
+        return TokenResponse(
+            access_token=access_token,
+            token_type="bearer",
+            expires_in=expire_minutes,
+            expires_at=expires_at
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Token refresh error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="שגיאה בחידוש הטוקן"
+        )
+
+@router.get("/token-info", response_model=TokenInfo)
+async def get_token_info(current_user: dict = Depends(get_current_user)):
+    """קבלת מידע על תוקף הטוקן הנוכחי"""
+    # הטוקן כבר אומת ב-dependency, אז נחזיר מידע כללי
+    from fastapi import Request
+    
+    return TokenInfo(
+        expires_at="ידוע רק מהטוקן עצמו",
+        time_left_minutes=0,  # נדרש גישה ישירה לטוקן
+        is_expired=False
+    )
+
+@router.post("/register")
 async def register(request: RegisterRequest, db: Session = Depends(get_db)):
     """רישום משתמש חדש"""
     try:
@@ -185,15 +218,15 @@ async def register(request: RegisterRequest, db: Session = Depends(get_db)):
         
         logger.info(f"New user registered: {new_user.username}")
         
-        return AuthResponse(
-            status="success",
-            message="משתמש נוצר בהצלחה",
-            data={
+        return {
+            "status": "success",
+            "message": "משתמש נוצר בהצלחה",
+            "data": {
                 "username": new_user.username,
                 "email": new_user.email,
                 "user_id": new_user.id
             }
-        )
+        }
         
     except HTTPException:
         raise
@@ -210,13 +243,27 @@ async def get_current_user_info(current_user: dict = Depends(get_current_user)):
     return UserInfo(
         username=current_user["username"],
         user_id=current_user["user_id"],
-        email=current_user.get("email", "")
+        email=current_user.get("email", ""),
+        is_admin=current_user.get("is_admin", False)
     )
 
 @router.post("/logout")
 async def logout():
-    """התנתקות"""
+    """התנתקות - הטוקן יפסיק לעבוד אוטומטית"""
     return {"message": "התנתקת בהצלחה"}
+
+@router.get("/settings")
+async def get_auth_settings():
+    """קבלת הגדרות זמני תוקף"""
+    return {
+        "token_expiry_minutes": TOKEN_EXPIRY_SETTINGS,
+        "description": {
+            "regular_user": "משתמש רגיל",
+            "admin": "מנהל מערכת", 
+            "premium": "משתמש עם 'זכור אותי'",
+            "api_client": "קליינט API"
+        }
+    }
 
 @router.get("/health")
 async def auth_health():
@@ -224,5 +271,6 @@ async def auth_health():
     return {
         "status": "healthy",
         "service": "authentication",
-        "endpoints": ["/login", "/register", "/me", "/logout"]
+        "features": ["login", "register", "refresh_token", "token_info"],
+        "default_token_expiry_minutes": TOKEN_EXPIRY_SETTINGS["regular_user"]
     }
