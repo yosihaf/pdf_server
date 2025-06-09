@@ -5,8 +5,9 @@ import logging
 import os
 from app.routers import pdf
 from app.routers import books 
-
+from app.routers import auth
 from .config import APP_NAME, APP_VERSION, APP_DESCRIPTION, ALLOWED_ORIGINS, LOG_LEVEL, LOG_FORMAT
+from app.auth.middleware import JWTMiddleware  # הוסף import
 
 # הגדרת logging
 logging.basicConfig(level=logging.INFO)
@@ -16,10 +17,21 @@ logger = logging.getLogger(__name__)
 os.makedirs('/app/output', exist_ok=True)
 
 app = FastAPI(
-    title="Wiki to PDF API",
+    title="אתרי מכון חכמת התורה לספר",
     description="API להמרת דפי ויקי לקובץ PDF וניהול ספרים", 
     version="1.0.0",
 )
+
+
+app.add_middleware(
+    JWTMiddleware,
+    protected_paths=[
+        "/api/pdf/generate",      # הגן על יצירת PDF
+        "/api/pdf/download",      # הגן על הורדות
+        "/api/books/folder",      # הגן על גישה לתיקיות ספציפיות
+    ]
+)
+
 
 # הגדרת CORS
 app.add_middleware(
@@ -34,6 +46,7 @@ app.add_middleware(
 # הוספת נתב ה-PDF
 app.include_router(pdf.router)
 app.include_router(books.router)
+app.include_router(auth.router)
 
 @app.get("/")
 def read_root():

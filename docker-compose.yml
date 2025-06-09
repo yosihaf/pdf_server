@@ -12,7 +12,17 @@ services:
     environment:
       - LOG_LEVEL=info
     networks:
-      - gbr1         
+      - gbr1
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_DB: wiki_db
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    networks:
+      - gbr1               
 networks:
   gbr1:
     external: true      
