@@ -1,8 +1,7 @@
+# app/database/models.py - גרסה מתוקנת
 from sqlalchemy import Column, Integer, String, DateTime, Boolean
-from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
-
-Base = declarative_base()
+from .connection import Base  # ייבוא ה-Base מ-connection
 
 class User(Base):
     __tablename__ = "users"

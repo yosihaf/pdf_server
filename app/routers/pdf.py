@@ -108,7 +108,7 @@ async def download_pdf(task_id: str, filename: str):
     )
     
 @router.get("/view/{task_id}/{filename}")
-async def download_pdf(task_id: str, filename: str):
+async def view_pdf(task_id: str, filename: str):
     """
     הורדת קובץ PDF לפי מזהה משימה ושם קובץ
     """

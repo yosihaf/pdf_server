@@ -287,7 +287,7 @@ def convert_urls_to_pdfs(task_id: str, wiki_pages: List[str],
         # מיזוג הקבצים
         if pdf_files:
             # וודא שתיקיית הפלט קיימת
-            output_dir = os.path.join('/app/output', task_id)
+            output_dir = os.path.join('./app/output', task_id)  # נתיב יחסי
             os.makedirs(output_dir, exist_ok=True)
             
             merged_path = os.path.join(output_dir, f'{book_title.replace(" ", "_")}.pdf')
