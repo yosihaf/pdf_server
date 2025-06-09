@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  api: 
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: wiki-to-pdf-api
+    volumes:
+      - ./output:/app/output
+    restart: always
+    environment:
+      - LOG_LEVEL=info
+    networks:
+      - gbr1         
+networks:
+  gbr1:
+    external: true      
