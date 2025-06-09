@@ -20,27 +20,7 @@ logger = logging.getLogger(__name__)
 # יצירת instance של השירות
 books_service = BooksService(BASE_BOOKS_PATH)
 
-@router.get("/", response_model=BooksResponse)
-async def get_all_books():
-    """
-    מחזיר את כל הספרים מכל התקיות
-    """
-    try: 
-        books = books_service.get_all_books()
-        logger.info(f"Retrieved {len(books)} books")
-        
-        return BooksResponse(
-            status="success",
-            count=len(books),
-            books=books
-        )
-    
-    except Exception as e:
-        logger.error(f"Error getting all books: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="שגיאה בקבלת רשימת הספרים"
-        )
+
 @router.get("", response_model=BooksResponse)
 async def get_all_books():
     """

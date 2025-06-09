@@ -8,11 +8,12 @@ from app.routers import books
 from app.routers import auth
 from .config import APP_NAME, APP_VERSION, APP_DESCRIPTION, ALLOWED_ORIGINS, LOG_LEVEL, LOG_FORMAT
 from app.auth.middleware import JWTMiddleware  # הוסף import
-
+from .database.connection import init_db
 # הגדרת logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
+# יצירת מסד הנתונים
+init_db()
 # יצירת תיקיית פלט אם לא קיימת
 os.makedirs('/app/output', exist_ok=True)
 
@@ -26,9 +27,16 @@ app = FastAPI(
 app.add_middleware(
     JWTMiddleware,
     protected_paths=[
-        "/api/pdf/generate",      # הגן על יצירת PDF
-        "/api/pdf/download",      # הגן על הורדות
-        "/api/books/folder",      # הגן על גישה לתיקיות ספציפיות
+        "/api/pdf/generate",      
+        "/api/pdf/download",      
+        "/api/pdf/view", 
+        "/api/pdf/status",        # הוסף את זה!
+        "/api/books",             
+        "/api/books/folder",      
+        "/api/books/folders",     
+        "/api/books/download",    
+        "/api/books/view",        
+        "/api/books/search",   
     ]
 )
 
@@ -57,6 +65,7 @@ def read_root():
             "generate_pdf": "/api/pdf/generate",
             "check_status": "/api/pdf/status/{task_id}",
             "download_pdf": "/api/pdf/download/{task_id}/{filename}",
+            "view_pdf": "/api/pdf/view/{task_id}/{filename}",
             "books_list": "/api/books/",
             "books_folders": "/api/books/folders",
             "books_search": "/api/books/search?q=query",

@@ -13,7 +13,7 @@ class BooksService:
     
     def __init__(self, base_path: str):
         self.base_path = base_path
-        self.base_path = os.getenv("BOOKS_PATH", "/app/output")  # שנה לנתיב הנכון
+        self.base_path = os.getenv("BOOKS_PATH", "/app/output")  # דורס את הפרמטר
     
     def _get_books_from_directory(self) -> List[dict]:
         """
