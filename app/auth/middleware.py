@@ -1,149 +1,87 @@
-# החלף את app/auth/middleware.py עם הקוד הזה:
+# app/auth/jwt_handler.py - הגדרות זמן תוקף נוכחיות
 
-from fastapi import Request, HTTPException, status
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import BaseHTTPMiddleware
-import logging
-from .jwt_handler import verify_token
+from datetime import datetime, timedelta
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+import os
 
-logger = logging.getLogger(__name__)
+SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-here")
+ALGORITHM = "HS256"
 
-class JWTMiddleware(BaseHTTPMiddleware):
-    """Middleware לבדיקת JWT טוקנים אוטומטית"""
+# ⏰ זמן תוקף הטוקן - כרגע 30 דקות
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 30))
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def create_access_token(data: dict, expires_delta: timedelta = None):
+    """יצירת טוקן גישה עם זמן תוקף"""
+    to_encode = data.copy()
     
-    def __init__(self, app, protected_paths: list = None):
-        super().__init__(app)
-        
-        # נתיבים שדורשים אימות
-        self.protected_paths = protected_paths or [
-            "/api/books",
-            "/api/pdf/generate",
-            "/api/pdf/download",
-        ]
-        
-        # נתיבים ציבוריים (מדויקים!)
-        self.public_paths = [
-            "/",
-            "/health", 
-            "/docs",
-            "/openapi.json",
-            "/redoc",
-            "/api/auth/login",
-            "/api/auth/register",
-            "/api/auth/health",
-            "/api/books/health",  # רק זה ציבורי, לא כל /api/books
-        ]
-
-    async def dispatch(self, request: Request, call_next):
-        """בדיקת כל בקשה שמגיעה לשרת"""
-        path = request.url.path
-        method = request.method
-        
-        # דלג על בקשות OPTIONS (CORS)
-        if method == "OPTIONS":
-            return await call_next(request)
-        
-        # בדוק אם הנתיב ציבורי (בדיקה מדויקת!)
-        if self._is_public_path(path):
-            logger.debug(f"Public path accessed: {path}")
-            return await call_next(request)
-        
-        # בדוק אם הנתיב דורש הגנה
-        if self._is_protected_path(path):
-            # בדוק טוקן
-            auth_result = await self._validate_token(request)
-            
-            if not auth_result["valid"]:
-                logger.warning(f"Unauthorized access attempt to: {path}")
-                return JSONResponse(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    content={
-                        "detail": "נדרש טוקן אימות תקף",
-                        "error_code": "UNAUTHORIZED",
-                        "message": auth_result["message"]
-                    },
-                    headers={"WWW-Authenticate": "Bearer"}
-                )
-            
-            # הוסף מידע על המשתמש לבקשה
-            request.state.user = auth_result["user"]
-            logger.info(f"Authorized access: {auth_result['user'].get('username')} -> {path}")
-        
-        # המשך לטיפול הרגיל בבקשה
-        response = await call_next(request)
-        return response
-
-    def _is_public_path(self, path: str) -> bool:
-        """בדוק אם הנתיב ציבורי - בדיקה מדויקת!"""
-        # בדיקה מדויקת עבור נתיבים שלמים
-        if path in self.public_paths:
-            return True
-        
-        # בדיקה עבור נתיבים שמתחילים עם נתיב ציבורי
-        public_prefixes = ["/docs", "/openapi.json", "/redoc"]
-        for prefix in public_prefixes:
-            if path.startswith(prefix):
-                return True
-                
-        return False
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        # ברירת מחדל - 30 דקות
+        expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     
-    def _is_protected_path(self, path: str) -> bool:
-        """בדוק אם הנתיב מוגן"""
-        return any(path.startswith(protected_path) for protected_path in self.protected_paths)
-    
-    async def _validate_token(self, request: Request) -> dict:
-        """
-        בדיקת טוקן JWT מההיידר
-        מחזיר: {"valid": bool, "user": dict, "message": str}
-        """
-        try:
-            # חפש טוקן בהיידר Authorization
-            auth_header = request.headers.get("Authorization")
-            if not auth_header:
-                return {
-                    "valid": False, 
-                    "user": {}, 
-                    "message": "חסר כותרת Authorization"
-                }
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def create_refresh_token(data: dict):
+    """יצירת refresh token עם תוקף ארוך יותר - 7 ימים"""
+    to_encode = data.copy()
+    expire = datetime.utcnow() + timedelta(days=7)
+    to_encode.update({
+        "exp": expire,
+        "type": "refresh"  # סימון שזה refresh token
+    })
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+def verify_token(token: str):
+    """אימות טוקן והחזרת הנתונים"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        
+        # בדוק שהטוקן לא פג תוקף
+        if payload.get("exp") < datetime.utcnow().timestamp():
+            return None
             
-            # בדוק פורמט Bearer
-            if not auth_header.startswith("Bearer "):
-                return {
-                    "valid": False, 
-                    "user": {}, 
-                    "message": "פורמט טוקן שגוי - נדרש Bearer token"
-                }
-            
-            # חלץ את הטוקן
-            token = auth_header.split(" ")[1]
-            
-            # אמת את הטוקן
-            payload = verify_token(token)
-            if not payload:
-                return {
-                    "valid": False, 
-                    "user": {}, 
-                    "message": "טוקן לא תקף או פג תוקף"
-                }
-            
-            # החזר מידע על המשתמש
-            user_info = {
-                "username": payload.get("sub"),
-                "user_id": payload.get("user_id"),
-                "email": payload.get("email"),
-                "expires": payload.get("exp")
-            }
+        return payload
+    except JWTError:
+        return None
+
+def hash_password(password: str):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password: str, hashed_password: str):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_token_expiry_info(token: str) -> dict:
+    """קבלת מידע על תוקף הטוקן"""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        exp_timestamp = payload.get("exp")
+        
+        if exp_timestamp:
+            exp_datetime = datetime.fromtimestamp(exp_timestamp)
+            now = datetime.utcnow()
+            time_left = exp_datetime - now
             
             return {
-                "valid": True, 
-                "user": user_info, 
-                "message": "טוקן תקף"
+                "expires_at": exp_datetime.isoformat(),
+                "time_left_minutes": int(time_left.total_seconds() / 60),
+                "is_expired": time_left.total_seconds() <= 0
             }
-            
-        except Exception as e:
-            logger.error(f"Error validating token: {str(e)}")
-            return {
-                "valid": False, 
-                "user": {}, 
-                "message": f"שגיאה בבדיקת הטוקן: {str(e)}"
-            }
+    except:
+        pass
+    
+    return {"error": "לא ניתן לפענח את הטוקן"}
+
+# הגדרות זמן תוקף שונות לפי סוג משתמש
+TOKEN_EXPIRY_SETTINGS = {
+    "regular_user": 30,      # 30 דקות למשתמש רגיל
+    "admin": 120,           # 2 שעות למנהל
+    "premium": 480,         # 8 שעות למשתמש premium
+    "api_client": 1440      # 24 שעות לקליינט API
+}
