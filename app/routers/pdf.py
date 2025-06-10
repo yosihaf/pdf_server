@@ -1,4 +1,4 @@
-# app/routers/pdf.py - גרסה נקייה ומתוקנת
+# app/routers/pdf.py - עם מעקב יוצר מלא
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status, Depends
 from fastapi.responses import JSONResponse, FileResponse
@@ -24,19 +24,33 @@ router = APIRouter(
 
 logger = logging.getLogger(__name__)
 
-# מודל תגובה למשימות המשתמש
+# מודל תגובה מפורט למשימות המשתמש
 from pydantic import BaseModel
 
-class UserTaskResponse(BaseModel):
+class UserTaskDetailedResponse(BaseModel):
     task_id: str
     book_title: str
     description: str = None
     status: str
     message: str
     created_at: datetime
+    completed_at: datetime = None
     filename: str = None
     file_size: int = None
     is_public: bool = False
+    wiki_pages: List[str] = []
+    download_url: str = None
+    view_url: str = None
+    public_url: str = None
+
+class CreatorStatsResponse(BaseModel):
+    username: str
+    user_id: int
+    total_books_created: int
+    completed_books: int
+    public_books: int
+    success_rate: float
+    member_since: datetime
 
 @router.post("/generate", response_model=PDFResponse)
 async def generate_pdf(
@@ -46,7 +60,7 @@ async def generate_pdf(
     db: Session = Depends(get_db)
 ):
     """
-    יצירת PDF עם אפשרות לבחור ציבורי/פרטי
+    יצירת PDF עם שמירת פרטי היוצר
     """
     
     # בדיקה שיש ערכים להמרה
@@ -59,7 +73,7 @@ async def generate_pdf(
     # יצירת שירות PDF
     pdf_service = PDFService(db)
     
-    # יצירת משימה במסד הנתונים
+    # יצירת משימה במסד הנתונים עם פרטי היוצר
     pdf_task = pdf_service.create_pdf_task(
         user_id=int(current_user["user_id"]),
         wiki_pages=request.wiki_pages,
@@ -80,15 +94,66 @@ async def generate_pdf(
     )
     
     privacy_msg = "ציבורי" if request.is_public else "פרטי"
-    logger.info(f"User {current_user['username']} created {privacy_msg} PDF task {pdf_task.task_id}")
+    logger.info(f"User {current_user['username']} created {privacy_msg} PDF task {pdf_task.task_id} - Book: {request.book_title}")
     
     # החזרת מזהה המשימה
     return PDFResponse(
         task_id=pdf_task.task_id,
         status="processing",
-        message=f"המשימה החלה לרוץ - קובץ {privacy_msg}",
+        message=f"המשימה החלה לרוץ - קובץ {privacy_msg}. יוצר: {current_user['username']}",
         is_public=request.is_public
     )
+
+@router.get("/my-tasks", response_model=List[UserTaskDetailedResponse])
+async def get_my_tasks(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    limit: int = 20
+):
+    """
+    קבלת כל המשימות של המשתמש הנוכחי עם פרטים מלאים
+    """
+    pdf_service = PDFService(db)
+    tasks = pdf_service.get_user_tasks_detailed(int(current_user["user_id"]), limit)
+    
+    return [
+        UserTaskDetailedResponse(
+            task_id=task["task_id"],
+            book_title=task["book_title"],
+            description=task["description"],
+            status=task["status"],
+            message=task["message"] or "",
+            created_at=task["created_at"],
+            completed_at=task["completed_at"],
+            filename=task["filename"],
+            file_size=task["file_size"],
+            is_public=task["is_public"],
+            wiki_pages=task["wiki_pages"],
+            download_url=task["download_url"],
+            view_url=task["view_url"],
+            public_url=task["public_url"]
+        )
+        for task in tasks
+    ]
+
+@router.get("/my-stats", response_model=CreatorStatsResponse)
+async def get_my_creator_stats(
+    current_user: dict = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
+    """
+    סטטיסטיקות יצירת ספרים של המשתמש הנוכחי
+    """
+    pdf_service = PDFService(db)
+    stats = pdf_service.get_creator_stats(int(current_user["user_id"]))
+    
+    if not stats:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="לא נמצאו נתוני סטטיסטיקה"
+        )
+    
+    return CreatorStatsResponse(**stats)
 
 @router.get("/status/{task_id}", response_model=PDFStatus)
 async def check_status(
@@ -137,33 +202,6 @@ async def check_status(
         is_public=task.is_public
     )
 
-@router.get("/my-tasks", response_model=List[UserTaskResponse])
-async def get_my_tasks(
-    current_user: dict = Depends(get_current_user),
-    db: Session = Depends(get_db),
-    limit: int = 20
-):
-    """
-    קבלת כל המשימות של המשתמש הנוכחי
-    """
-    pdf_service = PDFService(db)
-    tasks = pdf_service.get_user_tasks(int(current_user["user_id"]), limit)
-    
-    return [
-        UserTaskResponse(
-            task_id=task.task_id,
-            book_title=task.book_title,
-            description=task.description,
-            status=task.status,
-            message=task.message or "",
-            created_at=task.created_at,
-            filename=task.filename,
-            file_size=task.file_size,
-            is_public=task.is_public
-        )
-        for task in tasks
-    ]
-
 @router.get("/download/{task_id}/{filename}")
 async def download_pdf(
     task_id: str, 
@@ -193,7 +231,7 @@ async def download_pdf(
             detail="הקובץ לא נמצא"
         )
     
-    logger.info(f"User {current_user['username']} downloading {decoded_filename}")
+    logger.info(f"User {current_user['username']} downloading their PDF: {decoded_filename} (task: {task_id})")
     
     return FileResponse(
         path=file_path, 
@@ -230,7 +268,7 @@ async def view_pdf(
             detail="הקובץ לא נמצא"
         )
     
-    logger.info(f"User {current_user['username']} viewing {decoded_filename}")
+    logger.info(f"User {current_user['username']} viewing their PDF: {decoded_filename} (task: {task_id})")
     
     return FileResponse(
         path=file_path, 
@@ -270,10 +308,11 @@ async def update_privacy(
         "status": "success",
         "message": f"הקובץ עודכן ל{privacy_status}",
         "task_id": task_id,
-        "is_public": is_public
+        "is_public": is_public,
+        "updated_by": current_user["username"]
     }
 
-# פונקציה מעודכנת ליצירת PDF עם מעקב
+# פונקציה מעודכנת ליצירת PDF עם מעקב מפורט
 async def create_pdf_with_tracking(
     task_id: str, 
     wiki_pages: List[str], 
@@ -281,7 +320,7 @@ async def create_pdf_with_tracking(
     base_url: str,
     user_id: int
 ):
-    """יצירת PDF עם עדכון במסד הנתונים"""
+    """יצירת PDF עם עדכון במסד הנתונים וmעקב יוצר"""
     
     # קבל חיבור למסד הנתונים
     from ..database.connection import SessionLocal
@@ -312,12 +351,12 @@ async def create_pdf_with_tracking(
                 file_size=file_size
             )
             
-            logger.info(f"PDF task {task_id} completed for user {user_id}")
+            logger.info(f"PDF task {task_id} completed successfully for user {user_id} - Book: {book_title}")
         else:
             pdf_service.update_task_status(task_id, "failed", "אירעה שגיאה במהלך ההמרה")
             
     except Exception as e:
-        logger.error(f"Error in PDF task {task_id}: {str(e)}")
+        logger.error(f"Error in PDF task {task_id} for user {user_id}: {str(e)}")
         if 'pdf_service' in locals():
             pdf_service.update_task_status(task_id, "failed", f"אירעה שגיאה: {str(e)}")
         
