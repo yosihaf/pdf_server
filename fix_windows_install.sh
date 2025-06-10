@@ -1,11 +1,11 @@
-# app/routers/auth.py - עם תיקון אימות לnettings
+# app/routers/auth.py - עם תיקון TokenResponse
 
 from fastapi import APIRouter, HTTPException, Depends, status, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
-from typing import Optional
 from datetime import timedelta
 import logging
+from typing import Optional
 
 from ..database.connection import get_db
 from ..database.models import User
@@ -39,7 +39,7 @@ class RegisterRequest(BaseModel):
 
 class TokenResponse(BaseModel):
     access_token: str
-    refresh_token: Optional[str] = None  # ← תיקון!
+    refresh_token: Optional[str] = None  # 🔧 תיקון: הפך לאופציונלי
     token_type: str
     expires_in: int  # בדקות
     expires_at: str  # זמן מדויק
@@ -102,7 +102,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
             expires_delta=timedelta(minutes=expire_minutes)
         )
         
-        # יצירת refresh token אם נבקש
+        # יצירת refresh token רק אם נבקש
         refresh_token = None
         if request.remember_me:
             refresh_token = create_refresh_token(token_data)
@@ -114,7 +114,7 @@ async def login(request: LoginRequest, db: Session = Depends(get_db)):
         
         return TokenResponse(
             access_token=access_token,
-            refresh_token=refresh_token,
+            refresh_token=refresh_token,  # יכול להיות None עכשיו
             token_type="bearer",
             expires_in=expire_minutes,
             expires_at=expires_at
@@ -162,6 +162,7 @@ async def refresh_token(request: RefreshTokenRequest):
         
         return TokenResponse(
             access_token=access_token,
+            refresh_token=None,  # לא מחזירים refresh token חדש
             token_type="bearer",
             expires_in=expire_minutes,
             expires_at=expires_at
