@@ -1,5 +1,4 @@
 output/
 venv/
-app.db.env
-.env
+app.db
 .env
