@@ -2,3 +2,4 @@ output/
 venv/
 app.db.env
 .env
+.env
