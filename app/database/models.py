@@ -1,6 +1,6 @@
 # app/database/models.py - הוסף את המודל הזה
 
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, Text, ForeignKey, Index
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from .connection import Base
@@ -51,3 +51,24 @@ class PDFTask(Base):
     
     # קשר למשתמש
     user = relationship("User", back_populates="pdf_tasks")
+    
+    
+class EmailVerification(Base):
+    """מודל לאימות מיילים"""
+    __tablename__ = "email_verifications"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    email = Column(String, index=True)
+    username = Column(String)
+    verification_code = Column(String)
+    created_at = Column(DateTime, server_default=func.now())
+    verified_at = Column(DateTime, nullable=True)
+    is_verified = Column(Boolean, default=False)
+    expires_at = Column(DateTime)
+    
+    # הוספת אינדקס לחיפוש מהיר
+    __table_args__ = (
+        Index('idx_email_code', 'email', 'verification_code'),
+        Index('idx_email_verified', 'email', 'is_verified'),
+    )
+    
