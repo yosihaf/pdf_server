@@ -1,4 +1,5 @@
-# ===== app/database/connection.py =====
+# app/database/connection.py - עבור SQLAlchemy 1.4.53
+
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -25,5 +26,5 @@ def get_db():
 
 def init_db():
     """יצירת הטבלאות"""
-    from .models import User  # import כאן כדי למנוע circular import
+    from .models import User, PDFTask, EmailVerification  # import כאן כדי למנוע circular import
     Base.metadata.create_all(bind=engine)

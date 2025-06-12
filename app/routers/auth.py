@@ -1,19 +1,14 @@
-# app/routers/auth.py - עם תיקון אימות לnettings
-
-from fastapi import APIRouter, HTTPException, Depends, status, Query
+from fastapi import APIRouter, HTTPException, Depends, status
 from sqlalchemy.orm import Session
-from pydantic import BaseModel, EmailStr
-from typing import Optional
-from datetime import timedelta
+from pydantic import BaseModel, EmailStr, validator
+from datetime import timedelta, datetime
 import logging
 
 from ..database.connection import get_db
-from ..database.models import User
-from ..auth.jwt_handler import (
-    create_access_token, create_refresh_token, verify_password, 
-    hash_password, get_token_expiry_info, TOKEN_EXPIRY_SETTINGS
-)
+from ..database.models import User, EmailVerification
+from ..auth.jwt_handler import create_access_token, hash_password, verify_password
 from ..auth.dependencies import get_current_user
+from ..auth.email_validator import EmailValidator
 
 logger = logging.getLogger(__name__)
 
@@ -26,171 +21,34 @@ router = APIRouter(
     }
 )
 
-# מודלים לבקשות
-class LoginRequest(BaseModel):
-    username: str
-    password: str
-    remember_me: bool = False  # האם לזכור אותי (טוקן ארוך יותר)
-
+# מודלים מעודכנים
 class RegisterRequest(BaseModel):
     username: str
     email: EmailStr
     password: str
-
-class TokenResponse(BaseModel):
-    access_token: str
-    refresh_token: Optional[str] = None  # ← תיקון!
-    token_type: str
-    expires_in: int  # בדקות
-    expires_at: str  # זמן מדויק
-
-class RefreshTokenRequest(BaseModel):
-    refresh_token: str
-
-class TokenInfo(BaseModel):
-    expires_at: str
-    time_left_minutes: int
-    is_expired: bool
-
-class UserInfo(BaseModel):
-    username: str
-    user_id: str
-    email: str
-    is_admin: bool = False
-
-@router.post("/login", response_model=TokenResponse)
-async def login(request: LoginRequest, db: Session = Depends(get_db)):
-    """התחברות עם אפשרות לבחור זמן תוקף"""
-    try:
-        # חיפוש המשתמש במסד הנתונים
-        user = db.query(User).filter(User.username == request.username).first()
-        
-        if not user or not verify_password(request.password, user.hashed_password):
-            logger.warning(f"Failed login attempt for username: {request.username}")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="שם משתמש או סיסמה שגויים",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        
-        if not user.is_active:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="החשבון אינו פעיל"
-            )
-        
-        # קבע זמן תוקף לפי סוג המשתמש והעדפות
-        if request.remember_me:
-            expire_minutes = TOKEN_EXPIRY_SETTINGS.get("premium", 480)  # 8 שעות
-        else:
-            # בדוק אם המשתמש הוא מנהל
-            is_admin = user.username in ["admin", "manager", "root"]
-            expire_minutes = TOKEN_EXPIRY_SETTINGS.get(
-                "admin" if is_admin else "regular_user", 30
-            )
-        
-        # יצירת טוקן
-        token_data = {
-            "sub": user.username,
-            "user_id": str(user.id),
-            "email": user.email,
-            "is_admin": is_admin
-        }
-        
-        access_token = create_access_token(
-            token_data, 
-            expires_delta=timedelta(minutes=expire_minutes)
-        )
-        
-        # יצירת refresh token אם נבקש
-        refresh_token = None
-        if request.remember_me:
-            refresh_token = create_refresh_token(token_data)
-        
-        from datetime import datetime
-        expires_at = (datetime.utcnow() + timedelta(minutes=expire_minutes)).isoformat()
-        
-        logger.info(f"Successful login for user: {user.username} (expires in {expire_minutes} minutes)")
-        
-        return TokenResponse(
-            access_token=access_token,
-            refresh_token=refresh_token,
-            token_type="bearer",
-            expires_in=expire_minutes,
-            expires_at=expires_at
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Login error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="שגיאה בהתחברות"
-        )
-
-@router.post("/refresh", response_model=TokenResponse)
-async def refresh_token(request: RefreshTokenRequest):
-    """חידוש טוקן באמצעות refresh token"""
-    try:
-        from ..auth.jwt_handler import verify_token
-        
-        # אמת את ה-refresh token
-        payload = verify_token(request.refresh_token)
-        if not payload or payload.get("type") != "refresh":
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Refresh token לא תקף"
-            )
-        
-        # יצור טוקן חדש
-        token_data = {
-            "sub": payload.get("sub"),
-            "user_id": payload.get("user_id"),
-            "email": payload.get("email"),
-            "is_admin": payload.get("is_admin", False)
-        }
-        
-        expire_minutes = TOKEN_EXPIRY_SETTINGS.get("regular_user", 30)
-        access_token = create_access_token(
-            token_data,
-            expires_delta=timedelta(minutes=expire_minutes)
-        )
-        
-        from datetime import datetime
-        expires_at = (datetime.utcnow() + timedelta(minutes=expire_minutes)).isoformat()
-        
-        return TokenResponse(
-            access_token=access_token,
-            token_type="bearer",
-            expires_in=expire_minutes,
-            expires_at=expires_at
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Token refresh error: {str(e)}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="שגיאה בחידוש הטוקן"
-        )
-
-@router.get("/token-info", response_model=TokenInfo)
-async def get_token_info(current_user: dict = Depends(get_current_user)):
-    """קבלת מידע על תוקף הטוקן הנוכחי"""
-    # הטוקן כבר אומת ב-dependency, אז נחזיר מידע כללי
-    from fastapi import Request
     
-    return TokenInfo(
-        expires_at="ידוע רק מהטוקן עצמו",
-        time_left_minutes=0,  # נדרש גישה ישירה לטוקן
-        is_expired=False
-    )
+    @validator('email')
+    def validate_email_domain(cls, v):
+        if not EmailValidator.is_allowed_domain(v):
+            raise ValueError('רק מיילים מדומיין cti.org.il מורשים להירשם')
+        return v
+    
+    @validator('password')
+    def validate_password(cls, v):
+        if len(v) < 8:
+            raise ValueError('הסיסמה חייבת להכיל לפחות 8 תווים')
+        return v
+
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    verification_code: str
+
+class ResendCodeRequest(BaseModel):
+    email: EmailStr
 
 @router.post("/register")
 async def register(request: RegisterRequest, db: Session = Depends(get_db)):
-    """רישום משתמש חדש"""
+    """רישום משתמש חדש עם אימות מייל"""
     try:
         # בדיקה שהמשתמש לא קיים
         existing_user = db.query(User).filter(
@@ -201,32 +59,64 @@ async def register(request: RegisterRequest, db: Session = Depends(get_db)):
         if existing_user:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="שם משתמש או אימייל כבר קיימים"
+                detail="שם משתמש או מייל כבר קיימים"
             )
         
-        # יצירת משתמש חדש
-        hashed_password = hash_password(request.password)
+        # בדיקת דומיין מייל
+        if not EmailValidator.is_allowed_domain(request.email):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="רק מיילים מדומיין cti.org.il מורשים להירשם"
+            )
         
-        new_user = User(
-            username=request.username,
+        # מחיקת אימותים קודמים לאותו מייל
+        db.query(EmailVerification).filter(
+            EmailVerification.email == request.email
+        ).delete()
+        
+        # יצירת קוד אימות
+        verification_code = EmailValidator.generate_verification_code()
+        expires_at = datetime.utcnow() + timedelta(minutes=15)
+        
+        # שמירת קוד האימות
+        email_verification = EmailVerification(
             email=request.email,
-            hashed_password=hashed_password
+            username=request.username,
+            verification_code=verification_code,
+            expires_at=expires_at
         )
         
-        db.add(new_user)
+        db.add(email_verification)
         db.commit()
-        db.refresh(new_user)
         
-        logger.info(f"New user registered: {new_user.username}")
+        # שליחת מייל אימות
+        email_sent = EmailValidator.send_verification_email(
+            request.email, 
+            verification_code, 
+            request.username
+        )
+        
+        if not email_sent:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="שגיאה בשליחת מייל האימות"
+            )
+        
+        # שמירת פרטי המשתמש זמנית (ללא הפעלה)
+        hashed_password = hash_password(request.password)
+        temp_user_data = {
+            "username": request.username,
+            "email": request.email,
+            "hashed_password": hashed_password
+        }
+        
+        logger.info(f"Registration initiated for {request.username} ({request.email})")
         
         return {
-            "status": "success",
-            "message": "משתמש נוצר בהצלחה",
-            "data": {
-                "username": new_user.username,
-                "email": new_user.email,
-                "user_id": new_user.id
-            }
+            "status": "verification_required",
+            "message": "נשלח קוד אימות למייל שלך. הקוד תקף למשך 15 דקות.",
+            "email": request.email,
+            "next_step": "השתמש ב-/api/auth/verify-email כדי להשלים את הרישום"
         }
         
     except HTTPException:
@@ -238,49 +128,153 @@ async def register(request: RegisterRequest, db: Session = Depends(get_db)):
             detail="שגיאה ברישום המשתמש"
         )
 
-@router.get("/me", response_model=UserInfo)
-async def get_current_user_info(current_user: dict = Depends(get_current_user)):
-    """קבלת מידע על המשתמש הנוכחי"""
-    return UserInfo(
-        username=current_user["username"],
-        user_id=current_user["user_id"],
-        email=current_user.get("email", ""),
-        is_admin=current_user.get("is_admin", False)
-    )
+@router.post("/verify-email")
+async def verify_email(request: VerifyEmailRequest, db: Session = Depends(get_db)):
+    """אימות מייל והשלמת רישום"""
+    try:
+        # חיפוש קוד האימות
+        verification = db.query(EmailVerification).filter(
+            EmailVerification.email == request.email,
+            EmailVerification.verification_code == request.verification_code,
+            EmailVerification.is_verified == False
+        ).first()
+        
+        if not verification:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="קוד אימות שגוי או לא קיים"
+            )
+        
+        # בדיקת תוקף הקוד
+        if datetime.utcnow() > verification.expires_at:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="קוד האימות פג תוקף. בקש קוד חדש."
+            )
+        
+        # בדיקה שהמשתמש לא קיים כבר
+        existing_user = db.query(User).filter(
+            (User.username == verification.username) | 
+            (User.email == verification.email)
+        ).first()
+        
+        if existing_user:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="המשתמש כבר קיים במערכת"
+            )
+        
+        # יצירת המשתמש הסופי
+        new_user = User(
+            username=verification.username,
+            email=verification.email,
+            hashed_password=hash_password("temp_password_will_be_set"),  # נדרוש הגדרת סיסמה
+            is_active=True
+        )
+        
+        db.add(new_user)
+        
+        # סימון האימות כמושלם
+        verification.is_verified = True
+        verification.verified_at = datetime.utcnow()
+        
+        db.commit()
+        db.refresh(new_user)
+        
+        # יצירת טוקן גישה
+        token_data = {
+            "sub": new_user.username,
+            "user_id": str(new_user.id),
+            "email": new_user.email
+        }
+        
+        access_token = create_access_token(token_data)
+        
+        logger.info(f"Email verified and user created: {new_user.username}")
+        
+        return {
+            "status": "success",
+            "message": "האימות הושלם בהצלחה! המשתמש נוצר.",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "username": new_user.username,
+                "email": new_user.email,
+                "user_id": new_user.id
+            }
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Email verification error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="שגיאה באימות המייל"
+        )
 
-@router.post("/logout")
-async def logout():
-    """התנתקות - הטוקן יפסיק לעבוד אוטומטית"""
-    return {"message": "התנתקת בהצלחה"}
+@router.post("/resend-code")
+async def resend_verification_code(request: ResendCodeRequest, db: Session = Depends(get_db)):
+    """שליחה מחדש של קוד אימות"""
+    try:
+        # חיפוש האימות הקיים
+        verification = db.query(EmailVerification).filter(
+            EmailVerification.email == request.email,
+            EmailVerification.is_verified == False
+        ).first()
+        
+        if not verification:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="לא נמצא תהליך רישום בהמתנה לאימות עבור מייל זה"
+            )
+        
+        # יצירת קוד חדש
+        new_code = EmailValidator.generate_verification_code()
+        verification.verification_code = new_code
+        verification.created_at = datetime.utcnow()
+        verification.expires_at = datetime.utcnow() + timedelta(minutes=15)
+        
+        db.commit()
+        
+        # שליחת המייל החדש
+        email_sent = EmailValidator.send_verification_email(
+            request.email,
+            new_code,
+            verification.username
+        )
+        
+        if not email_sent:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="שגיאה בשליחת קוד האימות החדש"
+            )
+        
+        logger.info(f"Verification code resent to {request.email}")
+        
+        return {
+            "status": "success",
+            "message": "קוד אימות חדש נשלח למייל שלך",
+            "expires_in_minutes": 15
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Resend code error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="שגיאה בשליחת קוד אימות חדש"
+        )
 
-@router.get("/settings")
-async def get_auth_settings(current_user: dict = Depends(get_current_user)):
-    """
-    קבלת הגדרות זמני תוקף - נדרש אימות
-    🔒 הוספנו אימות כאן!
-    """
-    logger.info(f"User {current_user['username']} accessed auth settings")
+@router.get("/check-email-domain")
+async def check_email_domain(email: str):
+    """בדיקה האם מייל מדומיין מורשה - endpoint ציבורי"""
+    is_allowed = EmailValidator.is_allowed_domain(email)
     
     return {
-        "token_expiry_minutes": TOKEN_EXPIRY_SETTINGS,
-        "description": {
-            "regular_user": "משתמש רגיל",
-            "admin": "מנהל מערכת", 
-            "premium": "משתמש עם 'זכור אותי'",
-            "api_client": "קליינט API"
-        },
-        "current_user": {
-            "username": current_user["username"],
-            "is_admin": current_user.get("is_admin", False)
-        }
-    }
-
-@router.get("/health")
-async def auth_health():
-    """בדיקת בריאות מערכת האימות - ציבורי"""
-    return {
-        "status": "healthy",
-        "service": "authentication",
-        "features": ["login", "register", "refresh_token", "token_info"],
-        "default_token_expiry_minutes": TOKEN_EXPIRY_SETTINGS["regular_user"]
+        "email": email,
+        "is_allowed": is_allowed,
+        "allowed_domains": EmailValidator.ALLOWED_DOMAINS,
+        "message": "מייל מורשה" if is_allowed else "רק מיילים מדומיין cti.org.il מורשים"
     }
