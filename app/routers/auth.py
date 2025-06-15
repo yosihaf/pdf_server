@@ -4,6 +4,9 @@ from pydantic import BaseModel, EmailStr, validator
 from datetime import timedelta, datetime
 import logging
 
+from dotenv import load_dotenv
+import os
+import httpx  # <-- גם את זה אם אתה משתמש בו
 from ..database.connection import get_db
 from ..database.models import User, EmailVerification
 from ..auth.jwt_handler import create_access_token, hash_password, verify_password
@@ -45,6 +48,264 @@ class VerifyEmailRequest(BaseModel):
 
 class ResendCodeRequest(BaseModel):
     email: EmailStr
+=======
+from google_auth_oauthlib.flow import Flow
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+router = APIRouter(
+    prefix="/api/auth", 
+    tags=["authentication"],
+    responses={
+        401: {"description": "לא מורשה"},
+        400: {"description": "בקשה שגויה"}
+    }
+)
+print("=== STARTING SERVER ===")
+print(f"GOOGLE_CLIENT_ID: {os.getenv('GOOGLE_CLIENT_ID')}")
+print(f"GOOGLE_CLIENT_SECRET: {os.getenv('GOOGLE_CLIENT_SECRET')}")
+print("========================")
+# מודלים מעודכנים
+class RegisterRequest(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+    
+    @validator('email')
+    def validate_email_domain(cls, v):
+        if not EmailValidator.is_allowed_domain(v):
+            raise ValueError('רק מיילים מדומיין cti.org.il מורשים להירשם')
+        return v
+    
+    @validator('password')
+    def validate_password(cls, v):
+        if len(v) < 8:
+            raise ValueError('הסיסמה חייבת להכיל לפחות 8 תווים')
+        return v
+
+class VerifyEmailRequest(BaseModel):
+    email: EmailStr
+    verification_code: str
+
+class ResendCodeRequest(BaseModel):
+    email: EmailStr
+
+
+# מודלים עבור Google OAuth
+class GoogleAuthResponse(BaseModel):
+    access_token: str
+    token_type: str
+    user: dict
+
+# הוספת פונקציות עזר לגוגל OAuth
+def create_google_flow():
+    """יצירת Google OAuth Flow"""
+    client_config = {
+        "web": {
+            "client_id": os.getenv("GOOGLE_CLIENT_ID"),
+            "client_secret": os.getenv("GOOGLE_CLIENT_SECRET"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "redirect_uris": [os.getenv("GOOGLE_REDIRECT_URI")]
+        }
+    }
+    
+    flow = Flow.from_client_config(
+        client_config=client_config,
+        scopes=['openid', 'email', 'profile']
+    )
+    
+    # הגדרת redirect URI
+    flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+    
+    return flow
+async def get_google_user_info(access_token: str):
+    """קבלת פרטי משתמש מגוגל"""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            "https://www.googleapis.com/oauth2/v2/userinfo",
+            headers={"Authorization": f"Bearer {access_token}"}
+        )
+        if response.status_code == 200:
+            return response.json()
+        return None
+
+# Google OAuth Endpoints
+@router.post("/google")
+async def google_login():
+    """התחלת תהליך אימות Google OAuth"""
+    try:
+        if not os.getenv("GOOGLE_CLIENT_ID") or not os.getenv("GOOGLE_CLIENT_SECRET"):
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="הגדרות Google OAuth לא מוגדרות כראוי"
+            )
+        
+        flow = create_google_flow()
+        flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+        
+        # יצירת URL לאימות
+        authorization_url, state = flow.authorization_url(
+            access_type='offline',
+            include_granted_scopes='true',
+            prompt='select_account'  # מאפשר לבחור חשבון
+        )
+        
+        logger.info("Google OAuth flow initiated")
+        
+        return {
+            "authorization_url": authorization_url,
+            "state": state,
+            "message": "העבר אל הקישור לאימות Google"
+        }
+        
+    except Exception as e:
+        logger.error(f"Google OAuth initiation error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="שגיאה ביצירת קישור אימות Google"
+        )
+
+@router.get("/google/callback")
+async def google_callback(code: str = None, state: str = None, error: str = None, db: Session = Depends(get_db)):
+    """Callback endpoint לגוגל OAuth"""
+    try:
+        # בדיקת שגיאות מגוגל
+        if error:
+            logger.warning(f"Google OAuth error: {error}")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"אימות Google נכשל: {error}"
+            )
+        
+        if not code:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="לא התקבל קוד אימות מגוגל"
+            )
+        
+        # יצירת Flow ולקבלת token
+        flow = create_google_flow()
+        flow.redirect_uri = os.getenv("GOOGLE_REDIRECT_URI")
+        
+        # החלפת הקוד ב-token
+        flow.fetch_token(code=code)
+        credentials = flow.credentials
+        
+        # קבלת פרטי המשתמש מגוגל
+        user_info = await get_google_user_info(credentials.token)
+        
+        if not user_info:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="לא ניתן לקבל פרטי משתמש מגוגל"
+            )
+        
+        google_email = user_info.get('email')
+        google_name = user_info.get('name', '')
+        google_id = user_info.get('id')
+        
+        # בדיקת דומיין מייל אם נדרש
+        if not EmailValidator.is_allowed_domain(google_email):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="רק מיילים מדומיין cti.org.il מורשים להתחבר"
+            )
+        
+        # חיפוש משתמש קיים או יצירת חדש
+        existing_user = db.query(User).filter(User.email == google_email).first()
+        
+        if existing_user:
+            # משתמש קיים - עדכון פרטים אם נדרש
+            if not existing_user.is_active:
+                existing_user.is_active = True
+                db.commit()
+            
+            user = existing_user
+            logger.info(f"Existing user logged in via Google: {user.username}")
+        else:
+            # יצירת משתמש חדש
+            # יצירת username מהשם או מהמייל
+            username = google_name.replace(' ', '_') or google_email.split('@')[0]
+            
+            # בדיקה שה-username לא קיים
+            counter = 1
+            original_username = username
+            while db.query(User).filter(User.username == username).first():
+                username = f"{original_username}_{counter}"
+                counter += 1
+            
+            new_user = User(
+                username=username,
+                email=google_email,
+                hashed_password="",  # לא צריך סיסמה לאימות Google
+                is_active=True,
+                # תוכל להוסיף שדות נוספים כמו google_id אם יש לך במודל
+            )
+            
+            db.add(new_user)
+            db.commit()
+            db.refresh(new_user)
+            
+            user = new_user
+            logger.info(f"New user created via Google OAuth: {user.username}")
+        
+        # יצירת JWT token
+        token_data = {
+            "sub": user.username,
+            "user_id": str(user.id),
+            "email": user.email
+        }
+        
+        access_token = create_access_token(token_data)
+        
+        return {
+            "status": "success",
+            "message": "התחברות בגוגל הושלמה בהצלחה",
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user": {
+                "username": user.username,
+                "email": user.email,
+                "user_id": user.id
+            },
+            "auth_method": "google"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Google OAuth callback error: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="שגיאה בתהליך אימות Google"
+        )
+
+@router.get("/google/user-info")
+async def get_current_google_user(current_user: User = Depends(get_current_user)):
+    """קבלת פרטי המשתמש הנוכחי (לאחר אימות Google או רגיל)"""
+    return {
+        "user_id": current_user.id,
+        "username": current_user.username,
+        "email": current_user.email,
+        "is_active": current_user.is_active,
+        "created_at": current_user.created_at if hasattr(current_user, 'created_at') else None
+    }
+
+# endpoint עזר לבדיקת הגדרות Google
+@router.get("/google/config-check")
+async def check_google_config():
+    """בדיקה שהגדרות Google מוגדרות כראוי - רק לפיתוח"""
+    return {
+        "google_client_id_set": bool(os.getenv("GOOGLE_CLIENT_ID")),
+        "google_client_secret_set": bool(os.getenv("GOOGLE_CLIENT_SECRET")),
+        "google_redirect_uri": os.getenv("GOOGLE_REDIRECT_URI"),
+        "status": "ready" if (os.getenv("GOOGLE_CLIENT_ID") and os.getenv("GOOGLE_CLIENT_SECRET")) else "missing_config"
+    }
+
+
+
+>>>>>>> f1115412e3368df770d77030654bd3f7f0759d55
 
 @router.post("/register")
 async def register(request: RegisterRequest, db: Session = Depends(get_db)):

@@ -1,3 +1,8 @@
 output/
 venv/
+
 app.db
+.env
+run_app.sh
+
+app/*/__pycache__

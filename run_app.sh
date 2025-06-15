@@ -1,5 +1,6 @@
 #!/bin/bash
 # run_app.sh - קובץ להרצת האפליקציה
+<<<<<<< HEAD
 
 echo "🚀 מתחיל להריץ את האפליקציה..."
 
@@ -32,5 +33,8 @@ echo "🌟 מפעיל את השרת..."
 echo "📍 השרת יפעל בכתובת: http://localhost:8000"
 echo "📋 תיעוד API: http://localhost:8000/docs"
 echo ""
+=======
+source venv/Scripts/activate
+>>>>>>> f1115412e3368df770d77030654bd3f7f0759d55
 
 uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
